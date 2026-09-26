@@ -36,3 +36,7 @@ netsim-embed = { version = "0.9.1", features = ["ipc"] }
 name = "discovery"
 harness = false
 required-features = ["serde"]
+
+# This checkout is both a standalone upstream fork and a Syzygy submodule;
+# keep its Cargo workspace independent from the parent repository.
+[workspace]

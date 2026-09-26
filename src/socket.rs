@@ -3,8 +3,11 @@ use hickory_proto::op::Message;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
-    sync::{Arc, RwLock},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
 };
 use thiserror::Error;
 use tokio::net::UdpSocket;
@@ -246,6 +249,8 @@ pub fn socket_v6() -> Result<UdpSocket, SocketError> {
 
 #[derive(Clone, Debug)]
 pub struct Sockets {
+    send_failures_v4: Arc<AtomicU64>,
+    send_failures_v6: Arc<AtomicU64>,
     v4: Option<Arc<UdpSocket>>,
     v6: Option<Arc<UdpSocket>>,
     interface_sockets_v4: Arc<RwLock<HashMap<Ipv4Addr, Arc<UdpSocket>>>>,
@@ -254,6 +259,9 @@ pub struct Sockets {
 impl Sockets {
     pub fn new(class: IpClass, multicast_interfaces: Vec<Ipv4Addr>) -> Result<Self, SocketError> {
         // Create interface-specific sockets for multi-interface mode
+        let send_failures_v4 = Arc::new(AtomicU64::new(0));
+        let send_failures_v6 = Arc::new(AtomicU64::new(0));
+
         let mut interface_sockets_v4 = HashMap::new();
         for addr in &multicast_interfaces {
             match socket_v4(Some(*addr)) {
@@ -271,6 +279,8 @@ impl Sockets {
         let sockets = match class {
             IpClass::Auto => {
                 let socket = Self {
+                    send_failures_v4: send_failures_v4.clone(),
+                    send_failures_v6: send_failures_v6.clone(),
                     v4: socket_v4(None).ok().map(Arc::new),
                     v6: socket_v6().ok().map(Arc::new),
                     interface_sockets_v4: interface_sockets_v4.clone(),
@@ -281,6 +291,8 @@ impl Sockets {
                 socket
             }
             _ => Self {
+                send_failures_v4: send_failures_v4.clone(),
+                send_failures_v6: send_failures_v6.clone(),
                 v4: class
                     .has_v4()
                     .then(|| socket_v4(None).map(Arc::new))
@@ -401,6 +413,22 @@ impl Sockets {
         interfaces.keys().copied().collect()
     }
 
+    /// Returns monotonically increasing counters for failed send attempts by IP class.
+    ///
+    /// Multi-interface IPv4 sends count each failing socket. A counter that stays
+    /// unchanged does not prove that sends succeeded, so callers must treat this as
+    /// failure evidence rather than as a liveness signal.
+    pub fn send_failure_count(&self, class: IpClass) -> u64 {
+        match class {
+            IpClass::V4Only => self.send_failures_v4.load(Ordering::Relaxed),
+            IpClass::V6Only | IpClass::V4AndV6 => self.send_failures_v6.load(Ordering::Relaxed),
+            IpClass::Auto => self
+                .send_failures_v4
+                .load(Ordering::Relaxed)
+                .saturating_add(self.send_failures_v6.load(Ordering::Relaxed)),
+        }
+    }
+
     pub async fn send_msg(&self, msg: &Message, mode: Mode) {
         let bytes = match msg.to_vec() {
             Ok(b) => b,
@@ -410,7 +438,6 @@ impl Sockets {
             }
         };
 
-        // Use multi-interface mode only for IPv4 when interface sockets are available
         let use_multi_interface = !self.interface_sockets_v4.read().unwrap().is_empty()
             && matches!(mode, Mode::V4 | Mode::Any);
 
@@ -420,46 +447,27 @@ impl Sockets {
                 self.interface_sockets_v4.read().unwrap().len()
             );
             self.send_msg_multi_interface_v4(&bytes, msg).await;
-
-            // If mode is Any, also send on IPv6 if available
-            if matches!(mode, Mode::Any) {
-                if let Some(v6) = &self.v6 {
-                    if let Err(e) = v6.send_to(&bytes, (MDNS_IPV6, MDNS_PORT)).await {
-                        tracing::warn!("error sending mDNS on IPv6: {}", e);
-                    } else {
-                        tracing::debug!(
-                            q = msg.queries.len(),
-                            an = msg.answers.len(),
-                            ad = msg.additionals.len(),
-                            "sent {} bytes on IPv6",
-                            bytes.len()
-                        );
-                    }
-                }
-            }
         } else {
-            // Single interface mode or IPv6-only
-            let (socket, addr) = match mode {
-                Mode::V4 => (self.v4.as_ref().unwrap(), IpAddr::from(MDNS_IPV4)),
-                Mode::V6 => (self.v6.as_ref().unwrap(), IpAddr::from(MDNS_IPV6)),
-                Mode::Any => {
-                    if let Some(v4) = &self.v4 {
-                        (v4, IpAddr::from(MDNS_IPV4))
-                    } else {
-                        (self.v6.as_ref().unwrap(), IpAddr::from(MDNS_IPV6))
-                    }
-                }
+            let (socket, target) = match mode {
+                Mode::V4 => (
+                    self.v4.as_ref(),
+                    SocketAddr::V4(SocketAddrV4::new(MDNS_IPV4, MDNS_PORT)),
+                ),
+                Mode::V6 | Mode::Any => (
+                    self.v6.as_ref(),
+                    SocketAddr::V6(SocketAddrV6::new(MDNS_IPV6, MDNS_PORT, 0, 0)),
+                ),
             };
-            if let Err(e) = socket.send_to(&bytes, (addr, MDNS_PORT)).await {
-                tracing::warn!("error sending mDNS: {}", e);
-            } else {
-                tracing::debug!(
-                    q = msg.queries.len(),
-                    an = msg.answers.len(),
-                    ad = msg.additionals.len(),
-                    "sent {} bytes",
-                    bytes.len()
-                );
+            if let Some(socket) = socket {
+                if let Err(e) = socket.send_to(&bytes, target).await {
+                    match mode {
+                        Mode::V4 => self.send_failures_v4.fetch_add(1, Ordering::Relaxed),
+                        Mode::V6 | Mode::Any => {
+                            self.send_failures_v6.fetch_add(1, Ordering::Relaxed)
+                        }
+                    };
+                    tracing::warn!("error sending mDNS: {}", e);
+                }
             }
         }
     }
@@ -471,6 +479,7 @@ impl Sockets {
         let interfaces = self.interface_sockets_v4.read().unwrap().clone();
         for (addr, socket) in interfaces.iter() {
             if let Err(e) = socket.send_to(bytes, (MDNS_IPV4, MDNS_PORT)).await {
+                self.send_failures_v4.fetch_add(1, Ordering::Relaxed);
                 tracing::error!("error sending mDNS on interface {}: {}", addr, e);
             } else {
                 tracing::debug!(

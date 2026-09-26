@@ -14,6 +14,7 @@ use std::{
     fmt::Display,
     net::{IpAddr, Ipv4Addr},
     str::FromStr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -399,6 +400,7 @@ impl Discoverer {
             })?;
 
         let rt = AcTokio::from_handle("swarm-discovery", handle.clone());
+        let shared_sockets = Arc::new(sockets.clone());
         let SupervisionRef { me, handle } = rt.spawn_actor("guardian", move |ctx| {
             guardian::guardian(ctx, self, sockets, service_name)
         });
@@ -406,6 +408,7 @@ impl Discoverer {
         Ok(DropGuard {
             task: Some(handle),
             aref: me,
+            sockets: shared_sockets,
             _rt: rt,
         })
     }
@@ -418,6 +421,7 @@ impl Discoverer {
 pub struct DropGuard {
     task: Option<TokioJoinHandle<()>>,
     aref: ActoRef<guardian::Input>,
+    sockets: Arc<Sockets>,
     _rt: AcTokio,
 }
 
@@ -435,6 +439,15 @@ impl DropGuard {
     /// Remove a specific address from the local addresses.
     pub fn remove_addr(&self, addr: IpAddr) {
         self.aref.send(guardian::Input::RemoveAddr(addr));
+    }
+
+    /// Returns monotonically increasing counters for failed socket sends.
+    ///
+    /// This is failure evidence only: a stable counter does not prove that
+    /// current sends are succeeding. Use this to stop and recreate discovery
+    /// when its sockets have entered a persistently failing state.
+    pub fn send_failure_count_v1(&self, class: IpClass) -> u64 {
+        self.sockets.send_failure_count(class)
     }
 
     /// Add a port and addresses to the local addresses.
