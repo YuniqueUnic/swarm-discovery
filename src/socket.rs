@@ -421,8 +421,8 @@ impl Sockets {
     pub fn send_failure_count(&self, class: IpClass) -> u64 {
         match class {
             IpClass::V4Only => self.send_failures_v4.load(Ordering::Relaxed),
-            IpClass::V6Only | IpClass::V4AndV6 => self.send_failures_v6.load(Ordering::Relaxed),
-            IpClass::Auto => self
+            IpClass::V6Only => self.send_failures_v6.load(Ordering::Relaxed),
+            IpClass::V4AndV6 | IpClass::Auto => self
                 .send_failures_v4
                 .load(Ordering::Relaxed)
                 .saturating_add(self.send_failures_v6.load(Ordering::Relaxed)),
