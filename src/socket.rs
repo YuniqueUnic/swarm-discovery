@@ -3,7 +3,7 @@ use hickory_proto::op::Message;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::HashMap,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, RwLock,
@@ -258,23 +258,9 @@ pub struct Sockets {
 
 impl Sockets {
     pub fn new(class: IpClass, multicast_interfaces: Vec<Ipv4Addr>) -> Result<Self, SocketError> {
-        // Create interface-specific sockets for multi-interface mode
         let send_failures_v4 = Arc::new(AtomicU64::new(0));
         let send_failures_v6 = Arc::new(AtomicU64::new(0));
-
-        let mut interface_sockets_v4 = HashMap::new();
-        for addr in &multicast_interfaces {
-            match socket_v4(Some(*addr)) {
-                Ok(socket) => {
-                    tracing::debug!("Created interface-specific socket for {}", addr);
-                    interface_sockets_v4.insert(*addr, Arc::new(socket));
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to create interface socket for {}: {}", addr, e);
-                }
-            }
-        }
-        let interface_sockets_v4 = Arc::new(RwLock::new(interface_sockets_v4));
+        let interface_sockets_v4 = Arc::new(RwLock::new(HashMap::new()));
 
         let sockets = match class {
             IpClass::Auto => {
@@ -304,8 +290,17 @@ impl Sockets {
                 interface_sockets_v4: interface_sockets_v4.clone(),
             },
         };
-        for addr in sockets.get_all_interface_addresses_v4() {
-            sockets.join_group_on_main_v4(addr);
+        // Bind the reusable wildcard listener before its interface-specific sockets.
+        // On macOS, a pre-existing mDNS listener can otherwise make the first
+        // unicast bind fail with EADDRINUSE, silently dropping the requested interface.
+        for addr in multicast_interfaces {
+            if let Err(error) = sockets.add_interface_v4(addr) {
+                tracing::warn!(
+                    "Failed to create interface socket for {}: {:?}",
+                    addr,
+                    error
+                );
+            }
         }
         Ok(sockets)
     }
@@ -438,6 +433,7 @@ impl Sockets {
             }
         };
 
+        // Use multi-interface mode only for IPv4 when interface sockets are available
         let use_multi_interface = !self.interface_sockets_v4.read().unwrap().is_empty()
             && matches!(mode, Mode::V4 | Mode::Any);
 
@@ -447,27 +443,51 @@ impl Sockets {
                 self.interface_sockets_v4.read().unwrap().len()
             );
             self.send_msg_multi_interface_v4(&bytes, msg).await;
-        } else {
-            let (socket, target) = match mode {
-                Mode::V4 => (
-                    self.v4.as_ref(),
-                    SocketAddr::V4(SocketAddrV4::new(MDNS_IPV4, MDNS_PORT)),
-                ),
-                Mode::V6 | Mode::Any => (
-                    self.v6.as_ref(),
-                    SocketAddr::V6(SocketAddrV6::new(MDNS_IPV6, MDNS_PORT, 0, 0)),
-                ),
-            };
-            if let Some(socket) = socket {
-                if let Err(e) = socket.send_to(&bytes, target).await {
-                    match mode {
-                        Mode::V4 => self.send_failures_v4.fetch_add(1, Ordering::Relaxed),
-                        Mode::V6 | Mode::Any => {
-                            self.send_failures_v6.fetch_add(1, Ordering::Relaxed)
-                        }
-                    };
-                    tracing::warn!("error sending mDNS: {}", e);
+
+            // If mode is Any, also send on IPv6 if available
+            if matches!(mode, Mode::Any) {
+                if let Some(v6) = &self.v6 {
+                    if let Err(e) = v6.send_to(&bytes, (MDNS_IPV6, MDNS_PORT)).await {
+                        self.send_failures_v6.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!("error sending mDNS on IPv6: {}", e);
+                    } else {
+                        tracing::debug!(
+                            q = msg.queries.len(),
+                            an = msg.answers.len(),
+                            ad = msg.additionals.len(),
+                            "sent {} bytes on IPv6",
+                            bytes.len()
+                        );
+                    }
                 }
+            }
+        } else {
+            // Single interface mode or IPv6-only
+            let (socket, addr) = match mode {
+                Mode::V4 => (self.v4.as_ref().unwrap(), IpAddr::from(MDNS_IPV4)),
+                Mode::V6 => (self.v6.as_ref().unwrap(), IpAddr::from(MDNS_IPV6)),
+                Mode::Any => {
+                    if let Some(v4) = &self.v4 {
+                        (v4, IpAddr::from(MDNS_IPV4))
+                    } else {
+                        (self.v6.as_ref().unwrap(), IpAddr::from(MDNS_IPV6))
+                    }
+                }
+            };
+            if let Err(e) = socket.send_to(&bytes, (addr, MDNS_PORT)).await {
+                match addr {
+                    IpAddr::V4(_) => self.send_failures_v4.fetch_add(1, Ordering::Relaxed),
+                    IpAddr::V6(_) => self.send_failures_v6.fetch_add(1, Ordering::Relaxed),
+                };
+                tracing::warn!("error sending mDNS: {}", e);
+            } else {
+                tracing::debug!(
+                    q = msg.queries.len(),
+                    an = msg.answers.len(),
+                    ad = msg.additionals.len(),
+                    "sent {} bytes",
+                    bytes.len()
+                );
             }
         }
     }
