@@ -4,6 +4,7 @@ mod guardian;
 mod receiver;
 mod sender;
 mod socket;
+pub use socket::SendStats;
 mod updater;
 
 use acto::{AcTokio, ActoHandle, ActoRef, ActoRuntime, SupervisionRef, TokioJoinHandle};
@@ -441,11 +442,11 @@ impl DropGuard {
         self.aref.send(guardian::Input::RemoveAddr(addr));
     }
 
-    /// Returns monotonically increasing counters for failed socket sends.
-    ///
-    /// This is failure evidence only: a stable counter does not prove that
-    /// current sends are succeeding. Use this to stop and recreate discovery
-    /// when its sockets have entered a persistently failing state.
+    /// Per-family UDP send observations, in IPv4 / IPv6 order.
+    pub fn send_stats_v1(&self) -> [Option<SendStats>; 2] {
+        self.sockets.send_stats()
+    }
+
     pub fn send_failure_count_v1(&self, class: IpClass) -> u64 {
         self.sockets.send_failure_count(class)
     }

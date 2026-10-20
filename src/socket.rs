@@ -247,8 +247,17 @@ pub fn socket_v6() -> Result<UdpSocket, SocketError> {
     })
 }
 
+/// A successful UDP send is evidence for this socket family, not peer delivery.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SendStats {
+    pub failures: u64,
+    pub successes: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Sockets {
+    send_successes_v4: Arc<AtomicU64>,
+    send_successes_v6: Arc<AtomicU64>,
     send_failures_v4: Arc<AtomicU64>,
     send_failures_v6: Arc<AtomicU64>,
     v4: Option<Arc<UdpSocket>>,
@@ -258,6 +267,8 @@ pub struct Sockets {
 
 impl Sockets {
     pub fn new(class: IpClass, multicast_interfaces: Vec<Ipv4Addr>) -> Result<Self, SocketError> {
+        let send_successes_v4 = Arc::new(AtomicU64::new(0));
+        let send_successes_v6 = Arc::new(AtomicU64::new(0));
         let send_failures_v4 = Arc::new(AtomicU64::new(0));
         let send_failures_v6 = Arc::new(AtomicU64::new(0));
         let interface_sockets_v4 = Arc::new(RwLock::new(HashMap::new()));
@@ -265,6 +276,8 @@ impl Sockets {
         let sockets = match class {
             IpClass::Auto => {
                 let socket = Self {
+                    send_successes_v4: send_successes_v4.clone(),
+                    send_successes_v6: send_successes_v6.clone(),
                     send_failures_v4: send_failures_v4.clone(),
                     send_failures_v6: send_failures_v6.clone(),
                     v4: socket_v4(None).ok().map(Arc::new),
@@ -277,6 +290,8 @@ impl Sockets {
                 socket
             }
             _ => Self {
+                send_successes_v4: send_successes_v4.clone(),
+                send_successes_v6: send_successes_v6.clone(),
                 send_failures_v4: send_failures_v4.clone(),
                 send_failures_v6: send_failures_v6.clone(),
                 v4: class
@@ -424,6 +439,22 @@ impl Sockets {
         }
     }
 
+    /// IPv4 then IPv6. An absent socket family must not block recovery; a
+    /// present but quiet family must not be declared failed by its peer's errors.
+    pub fn send_stats(&self) -> [Option<SendStats>; 2] {
+        let v4 = self.v4.is_some() || !self.interface_sockets_v4.read().unwrap().is_empty();
+        [
+            v4.then(|| SendStats {
+                failures: self.send_failures_v4.load(Ordering::Relaxed),
+                successes: self.send_successes_v4.load(Ordering::Relaxed),
+            }),
+            self.v6.as_ref().map(|_| SendStats {
+                failures: self.send_failures_v6.load(Ordering::Relaxed),
+                successes: self.send_successes_v6.load(Ordering::Relaxed),
+            }),
+        ]
+    }
+
     pub async fn send_msg(&self, msg: &Message, mode: Mode) {
         let bytes = match msg.to_vec() {
             Ok(b) => b,
@@ -451,6 +482,7 @@ impl Sockets {
                         self.send_failures_v6.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!("error sending mDNS on IPv6: {}", e);
                     } else {
+                        self.send_successes_v6.fetch_add(1, Ordering::Relaxed);
                         tracing::debug!(
                             q = msg.queries.len(),
                             an = msg.answers.len(),
@@ -481,6 +513,10 @@ impl Sockets {
                 };
                 tracing::warn!("error sending mDNS: {}", e);
             } else {
+                match addr {
+                    IpAddr::V4(_) => self.send_successes_v4.fetch_add(1, Ordering::Relaxed),
+                    IpAddr::V6(_) => self.send_successes_v6.fetch_add(1, Ordering::Relaxed),
+                };
                 tracing::debug!(
                     q = msg.queries.len(),
                     an = msg.answers.len(),
@@ -502,6 +538,7 @@ impl Sockets {
                 self.send_failures_v4.fetch_add(1, Ordering::Relaxed);
                 tracing::error!("error sending mDNS on interface {}: {}", addr, e);
             } else {
+                self.send_successes_v4.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
                     addr = %addr,
                     q = msg.queries.len(),
