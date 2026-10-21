@@ -5,9 +5,14 @@ use crate::{
     updater::updater,
     Discoverer,
 };
-use acto::{AcTokioRuntime, ActoCell, ActoInput, ActoRef};
+use acto::{AcTokioRuntime, ActoCell, ActoId, ActoInput, ActoRef};
 use hickory_proto::rr::Name;
-use std::{collections::HashMap, mem::replace, net::IpAddr};
+use std::{
+    collections::{HashMap, HashSet},
+    mem::replace,
+    net::{IpAddr, Ipv4Addr},
+};
+use tokio_util::sync::CancellationToken;
 
 pub enum Input {
     RemoveAll,
@@ -18,6 +23,7 @@ pub enum Input {
     RemoveTxt(String),
     AddInterface(IpAddr),
     RemoveInterface(IpAddr),
+    SetInterfacesV4(Vec<Ipv4Addr>),
 }
 
 pub async fn guardian(
@@ -25,110 +31,183 @@ pub async fn guardian(
     mut discoverer: Discoverer,
     sockets: Sockets,
     service_name: Name,
-) {
+    cancel: CancellationToken,
+) -> Result<(), String> {
     let callback = replace(&mut discoverer.callback, Box::new(|_, _| {}));
     let tau = discoverer.tau;
     let phi = discoverer.phi;
+    let mut children = HashSet::new();
+    let worker_cancel = cancel.clone();
     let upd_ref = ctx.supervise(
-        ctx.spawn("updater", move |ctx| updater(ctx, tau, phi, callback))
-            .map_handle(Ok),
-    );
-
-    let sockets2 = sockets.clone();
-    let sn = service_name.clone();
-    let snd_ref = ctx.supervise(
-        ctx.spawn("sender", move |ctx| {
-            sender(ctx, sockets, upd_ref, discoverer, sn)
+        ctx.spawn("updater", move |ctx| async move {
+            tokio::select! {
+                biased;
+                _ = worker_cancel.cancelled() => {},
+                _ = updater(ctx, tau, phi, callback) => {},
+            }
         })
         .map_handle(Ok),
     );
+    children.insert(upd_ref.id());
 
-    if let Some(v4) = sockets2.v4() {
-        let service_name = service_name.clone();
-        let snd_ref = snd_ref.clone();
-        ctx.spawn_supervised("receiver_v4", move |ctx| {
-            receiver(ctx, service_name, v4, snd_ref)
-        });
-    }
+    let sockets2 = sockets.clone();
+    let sn = service_name.clone();
+    let worker_cancel = cancel.clone();
+    let snd_ref = ctx.supervise(
+        ctx.spawn("sender", move |ctx| async move {
+            tokio::select! {
+                biased;
+                _ = worker_cancel.cancelled() => {},
+                _ = sender(ctx, sockets, upd_ref, discoverer, sn) => {},
+            }
+        })
+        .map_handle(Ok),
+    );
+    children.insert(snd_ref.id());
 
-    if let Some(v6) = sockets2.v6() {
-        let service_name = service_name.clone();
-        let snd_ref = snd_ref.clone();
-        ctx.spawn_supervised("receiver_v6", move |ctx| {
-            receiver(ctx, service_name, v6, snd_ref)
-        });
-    }
-
-    // Track interface receivers so we can stop them when interfaces are removed
-    let mut interface_receivers: HashMap<IpAddr, ActoRef<()>> = HashMap::new();
-
-    // Start receivers for initial interface sockets
-    let initial_interfaces = sockets2.get_all_interface_addresses_v4();
-    for addr in initial_interfaces {
-        if let Some(socket) = sockets2.get_interface_socket_v4(addr) {
+    for (name, socket) in [
+        ("receiver_v4", sockets2.v4()),
+        ("receiver_v6", sockets2.v6()),
+    ] {
+        if let Some(socket) = socket {
             let service_name = service_name.clone();
             let snd_ref = snd_ref.clone();
-            let addr_str = addr.to_string();
-            let receiver_ref = ctx
-                .spawn_supervised(&format!("receiver_interface_{}", addr_str), move |ctx| {
-                    receiver(ctx, service_name, socket, snd_ref)
-                });
-            interface_receivers.insert(IpAddr::V4(addr), receiver_ref);
-            tracing::info!("Started receiver for initial interface {}", addr);
+            let worker_cancel = cancel.clone();
+            let receiver = ctx.spawn_supervised(name, move |ctx| async move {
+                tokio::select! {
+                    biased;
+                    _ = worker_cancel.cancelled() => Ok(()),
+                    result = receiver(ctx, service_name, socket, snd_ref) => result,
+                }
+            });
+            children.insert(receiver.id());
         }
     }
 
-    // only stop when a supervised actor stops
-    loop {
-        let msg = ctx.recv().await;
-        match msg {
-            ActoInput::NoMoreSenders => {}
-            ActoInput::Supervision { id, name, result } => {
-                match result {
-                    Ok(Ok(_)) => tracing::warn!("actor {:?} ({}) stopped", id, name),
-                    Ok(Err(e)) => {
-                        tracing::warn!("actor {:?} ({}) failed: {}", id, name, e)
-                    }
-                    Err(e) => {
-                        tracing::warn!("actor {:?} ({}) aborted: {}", id, name, e);
-                    }
-                }
-                break;
+    let mut interface_receivers = HashMap::<Ipv4Addr, (ActoId, CancellationToken)>::new();
+    let mut retiring = HashSet::new();
+    for addr in sockets2.get_all_interface_addresses_v4() {
+        let (id, token) =
+            spawn_interface_receiver(&mut ctx, &sockets2, &service_name, &snd_ref, &cancel, addr);
+        children.insert(id);
+        interface_receivers.insert(addr, (id, token));
+    }
+
+    let mut draining = false;
+    let mut failure = None;
+    while !children.is_empty() {
+        let msg = tokio::select! {
+            biased;
+            _ = cancel.cancelled(), if !draining => {
+                draining = true;
+                continue;
             }
-            ActoInput::Message(msg) => match &msg {
-                Input::AddInterface(addr) => {
-                    if let IpAddr::V4(ipv4) = addr {
-                        if let Err(e) = sockets2.add_interface_v4(*ipv4) {
-                            tracing::warn!("Failed to add interface {}: {}", addr, e);
-                        } else {
-                            // Start a receiver for the new interface socket
-                            if let Some(socket) = sockets2.get_interface_socket_v4(*ipv4) {
-                                let service_name = service_name.clone();
-                                let snd_ref = snd_ref.clone();
-                                let addr_str = addr.to_string();
-                                let receiver_ref = ctx.spawn_supervised(
-                                    &format!("receiver_interface_{}", addr_str),
-                                    move |ctx| receiver(ctx, service_name, socket, snd_ref),
-                                );
-                                interface_receivers.insert(*addr, receiver_ref);
-                                tracing::info!("Started receiver for interface {}", addr);
-                            }
-                        }
+            msg = ctx.recv() => msg,
+        };
+        match msg {
+            ActoInput::NoMoreSenders => {
+                cancel.cancel();
+            }
+            ActoInput::Supervision { id, name, result } => {
+                children.remove(&id);
+                let expected = retiring.remove(&id) || draining;
+                match result {
+                    Ok(Ok(())) if expected => {}
+                    other => {
+                        tracing::warn!(?id, %name, ?other, "discovery worker stopped; drain remaining workers");
+                        failure.get_or_insert_with(|| {
+                            format!("discovery worker {name} terminated unexpectedly: {other:?}")
+                        });
+                        cancel.cancel();
                     }
                 }
-                Input::RemoveInterface(addr) => {
-                    if let IpAddr::V4(ipv4) = addr {
-                        sockets2.remove_interface_v4(*ipv4);
-                        // Remove the receiver reference for this interface
-                        if interface_receivers.remove(addr).is_some() {
-                            tracing::info!("Removed receiver reference for interface {}", addr);
-                        }
+            }
+            ActoInput::Message(_) if draining => {}
+            ActoInput::Message(msg) => {
+                let desired = match msg {
+                    Input::AddInterface(IpAddr::V4(addr)) => {
+                        let mut desired: HashSet<_> = interface_receivers.keys().copied().collect();
+                        desired.insert(addr);
+                        desired
                     }
+                    Input::RemoveInterface(IpAddr::V4(addr)) => {
+                        let mut desired: HashSet<_> = interface_receivers.keys().copied().collect();
+                        desired.remove(&addr);
+                        desired
+                    }
+                    Input::SetInterfacesV4(interfaces) => interfaces.into_iter().collect(),
+                    Input::AddInterface(_) | Input::RemoveInterface(_) => continue,
+                    msg => {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {},
+                            _ = snd_ref.send_wait(sender::MdnsMsg::Update(msg)) => {},
+                        }
+                        continue;
+                    }
+                };
+                for addr in interface_receivers
+                    .keys()
+                    .copied()
+                    .filter(|addr| !desired.contains(addr))
+                    .collect::<Vec<_>>()
+                {
+                    let (id, token) = interface_receivers
+                        .remove(&addr)
+                        .expect("registered receiver");
+                    retiring.insert(id);
+                    token.cancel();
+                    sockets2.remove_interface_v4(addr);
                 }
-                _ => {
-                    snd_ref.send(sender::MdnsMsg::Update(msg));
+                for addr in desired {
+                    if interface_receivers.contains_key(&addr) {
+                        continue;
+                    }
+                    if let Err(error) = sockets2.add_interface_v4(addr) {
+                        tracing::warn!(%addr, %error, "failed to add multicast interface");
+                        continue;
+                    }
+                    let (id, token) = spawn_interface_receiver(
+                        &mut ctx,
+                        &sockets2,
+                        &service_name,
+                        &snd_ref,
+                        &cancel,
+                        addr,
+                    );
+                    children.insert(id);
+                    interface_receivers.insert(addr, (id, token));
                 }
-            },
+            }
         }
     }
+    failure.map_or(Ok(()), Err)
+}
+
+fn spawn_interface_receiver(
+    ctx: &mut ActoCell<Input, AcTokioRuntime, Result<(), ReceiverError>>,
+    sockets: &Sockets,
+    service_name: &Name,
+    snd_ref: &ActoRef<sender::MdnsMsg>,
+    cancel: &CancellationToken,
+    addr: Ipv4Addr,
+) -> (ActoId, CancellationToken) {
+    let socket = sockets
+        .get_interface_socket_v4(addr)
+        .expect("interface socket registered");
+    let service_name = service_name.clone();
+    let snd_ref = snd_ref.clone();
+    let token = cancel.child_token();
+    let worker_cancel = token.clone();
+    let receiver = ctx.spawn_supervised(
+        &format!("receiver_interface_{addr}"),
+        move |ctx| async move {
+            tokio::select! {
+                biased;
+                _ = worker_cancel.cancelled() => Ok(()),
+                result = receiver(ctx, service_name, socket, snd_ref) => result,
+            }
+        },
+    );
+    (receiver.id(), token)
 }

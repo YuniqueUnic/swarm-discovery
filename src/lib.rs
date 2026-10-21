@@ -13,13 +13,15 @@ use socket::{SocketError, Sockets};
 use std::{
     collections::BTreeMap,
     fmt::Display,
+    future::poll_fn,
     net::{IpAddr, Ipv4Addr},
+    pin::Pin,
     str::FromStr,
-    sync::Arc,
     time::{Duration, Instant},
 };
 use thiserror::Error;
-use tokio::runtime::Handle;
+use tokio::{runtime::Handle, sync::Mutex};
+use tokio_util::sync::CancellationToken;
 
 type Callback = Box<dyn FnMut(&str, &Peer) + Send + 'static>;
 
@@ -401,15 +403,18 @@ impl Discoverer {
             })?;
 
         let rt = AcTokio::from_handle("swarm-discovery", handle.clone());
-        let shared_sockets = Arc::new(sockets.clone());
+        let shared_sockets = sockets.clone();
+        let cancel = CancellationToken::new();
+        let guardian_cancel = cancel.clone();
         let SupervisionRef { me, handle } = rt.spawn_actor("guardian", move |ctx| {
-            guardian::guardian(ctx, self, sockets, service_name)
+            guardian::guardian(ctx, self, sockets, service_name, guardian_cancel)
         });
 
         Ok(DropGuard {
-            task: Some(handle),
+            shutdown: Mutex::new(Shutdown::Running(handle)),
+            cancel,
             aref: me,
-            sockets: shared_sockets,
+            sockets: std::sync::RwLock::new(Some(shared_sockets)),
             _rt: rt,
         })
     }
@@ -420,13 +425,59 @@ impl Discoverer {
 /// You can also use this guard to modify the local addresses while the discovery is running.
 #[must_use = "dropping this value will stop the mDNS discovery"]
 pub struct DropGuard {
-    task: Option<TokioJoinHandle<()>>,
+    shutdown: Mutex<Shutdown>,
+    cancel: CancellationToken,
     aref: ActoRef<guardian::Input>,
-    sockets: Arc<Sockets>,
+    sockets: std::sync::RwLock<Option<Sockets>>,
     _rt: AcTokio,
 }
 
+enum Shutdown {
+    Running(TokioJoinHandle<Result<(), String>>),
+    Finished(Result<(), String>),
+}
+
 impl DropGuard {
+    /// Stop and join the guardian and all supervised workers, then release sockets.
+    /// Cancelling this waiter retains the same task for the next caller to await.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.request_shutdown();
+        let mut shutdown = self.shutdown.lock().await;
+        match &mut *shutdown {
+            Shutdown::Finished(result) => result.clone(),
+            Shutdown::Running(handle) => {
+                let result = poll_fn(|cx| ActoHandle::poll(Pin::new(&mut *handle), cx))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(std::convert::identity);
+                self.sockets.write().unwrap().take();
+                *shutdown = Shutdown::Finished(result.clone());
+                result
+            }
+        }
+    }
+
+    /// Request cooperative shutdown without waiting. Use `shutdown` for completion.
+    pub fn request_shutdown(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Whether the guardian has exited (including unexpected worker termination).
+    pub async fn is_finished(&self) -> bool {
+        match &*self.shutdown.lock().await {
+            Shutdown::Running(handle) => handle.is_finished(),
+            Shutdown::Finished(_) => true,
+        }
+    }
+
+    /// Reconcile the complete IPv4 interface inventory on the guardian's mailbox.
+    /// Backpressure waits rather than dropping interface changes.
+    pub async fn set_interfaces_v4(&self, interfaces: Vec<Ipv4Addr>) -> bool {
+        self.aref
+            .send_wait(guardian::Input::SetInterfacesV4(interfaces))
+            .await
+    }
+
     /// Remove all local addresses and stop advertising.
     pub fn remove_all(&self) {
         self.aref.send(guardian::Input::RemoveAll);
@@ -444,11 +495,21 @@ impl DropGuard {
 
     /// Per-family UDP send observations, in IPv4 / IPv6 order.
     pub fn send_stats_v1(&self) -> [Option<SendStats>; 2] {
-        self.sockets.send_stats()
+        self.sockets
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(Sockets::send_stats)
+            .unwrap_or([None; 2])
     }
 
     pub fn send_failure_count_v1(&self, class: IpClass) -> u64 {
-        self.sockets.send_failure_count(class)
+        self.sockets
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|sockets| sockets.send_failure_count(class))
+            .unwrap_or_default()
     }
 
     /// Add a port and addresses to the local addresses.
@@ -507,7 +568,7 @@ impl DropGuard {
 
 impl Drop for DropGuard {
     fn drop(&mut self) {
-        self.task.take().unwrap().abort();
+        self.cancel.cancel();
     }
 }
 
